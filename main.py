@@ -33,14 +33,23 @@ def digest(inp: Input):
     if client is None:
         raise HTTPException(
             status_code=500,
-            detail="OPENAI_API_KEY が設定されていません。.env ではなく Render の Environment に OPENAI_API_KEY=sk-... を設定し、再デプロイしてください。"
+            detail=(
+                "OPENAI_API_KEY が設定されていません。"
+                ".env ではなく Render の Environment に "
+                "OPENAI_API_KEY=sk-... を設定し、再デプロイしてください。"
+            ),
         )
 
-    # モデルへの指示（JSONのみ返す）
+    # --- モデルへの指示（JSONのみ返す） ---
+    # ToDo には必ず「タスク内容 / 担当: ◯◯ / 期日: YYYY-MM-DD」を含めるように明示
     system = (
         "あなたは日本語の議事録要約アシスタントです。入力テキストから、"
-        '次のJSONスキーマに厳密に従って出力してください: {"要点": [""], "ToDo": [""], "提案": [""]}。'
-        "各配列は空でもよいが事実ベースで簡潔に。可能なら ToDo に「担当: 」「期日: YYYY-MM-DD」を含めて。"
+        '次のJSONスキーマに厳密に従って出力してください: '
+        '{"要点": [""], "ToDo": [""], "提案": [""]}。'
+        "各配列は空でもよいが、事実ベースで簡潔に書いてください。"
+        "ToDo の各要素は必ず『何をするか / 担当: ◯◯ / 期日: YYYY-MM-DD』という1行テキストにしてください。"
+        "例: 『議事録を共有する / 担当: 佐藤さん / 期日: 2023-11-20』。"
+        "タスク内容（何をするか）は省略せず、会議で決まった具体的なアクションを書いてください。"
         "不要な文章は一切出さず、純粋なJSONのみを返してください。"
     )
 
@@ -49,7 +58,7 @@ def digest(inp: Input):
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system},
-                {"role": "user", "content": f"テキスト:\n{inp.text}"}
+                {"role": "user", "content": f"テキスト:\n{inp.text}"},
             ],
             response_format={"type": "json_object"},
             temperature=0.2,
@@ -63,11 +72,11 @@ def digest(inp: Input):
         except json.JSONDecodeError as je:
             raise HTTPException(
                 status_code=502,
-                detail=f"LLM出力がJSONとして読み取れませんでした: {content[:200]}..."
+                detail=f"LLM出力がJSONとして読み取れませんでした: {content[:200]}...",
             ) from je
 
-        # --- 正規化：配列で来なかった場合や空要素を整える ---
-        for k in ("要点", "ToDo", "提案"):
+        # --- 正規化：要点 / 提案 は「文字列の配列」に揃える ---
+        for k in ("要点", "提案"):
             v = data.get(k, [])
             if isinstance(v, str):
                 v = [v]
@@ -75,38 +84,81 @@ def digest(inp: Input):
                 v = []
             data[k] = [str(x).strip() for x in v if str(x).strip()]
 
-        # --- ToDo が辞書の配列でもきれいに1行へ ---
+        # --- ToDo は文字列・辞書どちらでも受けて「1行テキスト」に揃える ---
+        todos_raw = data.get("ToDo", [])
+
+        # まず配列に揃える
+        if isinstance(todos_raw, str):
+            todos_raw = [todos_raw]
+        if not isinstance(todos_raw, list):
+            todos_raw = []
+
         def to_todo_line(x):
+            """辞書でも文字列でも、必ず
+            『タスク内容 / 担当: ◯◯ / 期日: YYYY-MM-DD』
+            の形に近づけるための正規化関数
+            """
+            # dict の場合（将来スキーマを辞書に変えても対応できるようにしておく）
             if isinstance(x, dict):
-                title = x.get("内容") or x.get("title") or x.get("task") or ""
+                title = (
+                    x.get("内容")
+                    or x.get("タスク")
+                    or x.get("task")
+                    or x.get("title")
+                    or ""
+                )
                 assignee = x.get("担当") or x.get("owner") or x.get("assignee")
                 due = x.get("期日") or x.get("due") or x.get("deadline")
-                parts = [p for p in [
+
+                # 内容が空なら、担当・期日などから仮タイトルを作る
+                if not title:
+                    parts_for_title = [x.get("メモ"), x.get("備考"), assignee]
+                    parts_for_title = [p for p in parts_for_title if p]
+                    title = " / ".join(parts_for_title) or "内容未記載"
+
+                parts = [
                     title,
                     f"担当: {assignee}" if assignee else None,
                     f"期日: {due}" if due else None,
-                ] if p]
-                if parts:
-                    return " / ".join(parts)
-                return json.dumps(x, ensure_ascii=False)
-            return str(x)
+                ]
+                parts = [p for p in parts if p]
+                return " / ".join(parts)
 
-        todos_lines = [to_todo_line(x) for x in data["ToDo"]]
+            # 文字列の場合は、そのまま使いつつ最低限のチェックだけ
+            s = str(x).strip()
+            if not s:
+                return ""
+            # 「担当」「期日」が含まれていない場合は、ざっくり補足だけ入れておく
+            if "担当:" not in s and "担当：" not in s:
+                s = s + " / 担当: 未設定"
+            if "期日:" not in s and "期日：" not in s:
+                s = s + " / 期日: 未設定"
+            return s
+
+        todos_lines = [to_todo_line(x) for x in todos_raw]
+        todos_lines = [t for t in todos_lines if t]  # 空行は落とす
+
+        # raw の ToDo も、Zapier から扱いやすいように整形済み文字列に置き換える
+        data["ToDo"] = todos_lines
 
         # --- 改行つきの整形テキスト ---
         def bullets(items):
             return "\n".join(f"- {item}" for item in items) or "- なし"
 
         formatted = (
-            "【要点】\n" + bullets(data["要点"]) +
-            "\n\n【ToDo】\n" + bullets(todos_lines) +
-            "\n\n【提案】\n" + bullets(data["提案"])
+            "【要点】\n"
+            + bullets(data["要点"])
+            + "\n\n【ToDo】\n"
+            + bullets(todos_lines)
+            + "\n\n【提案】\n"
+            + bullets(data["提案"])
         )
 
-        # Notionには formatted を使う。元の配列も欲しければ raw を参照
+        # Zapier / Notion には formatted を使う。配列が欲しければ raw を参照
         return {"raw": data, "formatted": formatted}
 
     except HTTPException:
+        # すでに意味のあるHTTPExceptionならそのまま投げ直す
         raise
     except Exception as e:
         # 予期しないエラーは500で返す
